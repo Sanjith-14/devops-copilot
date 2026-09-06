@@ -17,6 +17,14 @@ import { discoverModules, registerModules, registerCoreTools } from "./registry.
  * for the MCP protocol — writing logs there corrupts the JSON-RPC stream.
  */
 async function main(): Promise<void> {
+  // Subcommand mode: `devops-copilot login [--profile x]` runs the terminal
+  // login helper and exits — stdio is ours here, no MCP stream yet.
+  if (process.argv[2] === "login") {
+    const { runLogin } = await import("./login.js");
+    await runLogin(process.argv.slice(3));
+    return;
+  }
+
   const cfg = loadConfig();
   const factory = new AwsClientFactory(cfg);
   await factory.discoverAccounts();

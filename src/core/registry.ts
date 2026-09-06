@@ -99,12 +99,26 @@ export function registerModules(
             return { content: [{ type: "text" as const, text: JSON.stringify(tagged, null, 2) }] };
           } catch (err) {
             const message = err instanceof GuardrailViolation ? err.message : `Error in ${fullName}: ${String(err)}`;
-            return { content: [{ type: "text" as const, text: message }], isError: true };
+            return { content: [{ type: "text" as const, text: withLoginHint(message) }], isError: true };
           }
         },
       );
     }
   }
+}
+
+/**
+ * Append a login instruction to credential-expiry errors so the LLM can tell
+ * the user exactly what to run — instead of surfacing a bare SDK error.
+ */
+function withLoginHint(message: string): string {
+  if (/sso.*(expired|invalid|token)/i.test(message) || /SSOTokenProviderFailure/.test(message)) {
+    return `${message}\nHint: the SSO session has expired — ask the user to run \`aws sso login --profile <profile>\` in a terminal, then retry.`;
+  }
+  if (/ExpiredToken|token.*expired|credentials.*expired/i.test(message)) {
+    return `${message}\nHint: temporary credentials have expired — ask the user to re-run \`devops-copilot login --profile <profile>\` (or their usual AWS login) in a terminal, then retry.`;
+  }
+  return message;
 }
 
 /**
