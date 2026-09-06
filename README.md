@@ -57,6 +57,58 @@ Restart Claude Desktop and ask: *"List my S3 buckets and check whether any are p
 | `DEVOPS_COPILOT_ALLOW_DESTRUCTIVE` | `false` | Gate for destructive tools (user approval still required) |
 | `AWS_REGION` | `us-east-1` | Fallback region when a profile has none |
 
+## Credentials & login
+
+The server never handles passwords itself — it discovers and uses whatever is
+in `~/.aws`. Three supported flows:
+
+**Plain access keys** — `aws configure --profile <name>` once; nothing else needed.
+
+**SSO (browser + MFA)** — `aws configure sso` once, then per session:
+
+```bash
+aws sso login --profile <name>
+```
+
+**MFA-gated IAM keys (terminal + TOTP)** — for profiles whose IAM policy
+denies everything until an MFA session exists. The built-in `login`
+subcommand mints temporary session credentials into a `[copilot-session]`
+profile the server auto-discovers:
+
+```bash
+# 1. one-time: point the profile at your MFA device
+#    (device ARN: AWS console → IAM → your user → Security credentials;
+#     looks like arn:aws:iam::<account-id>:mfa/<device-name>)
+aws configure set mfa_serial arn:aws:iam::<account-id>:mfa/<device-name> --profile <name>
+
+# 2. each session: prompts for your 6-digit TOTP code
+node dist/core/server.js login --profile <name> --duration-hours 8
+
+# 3. verify — these succeed because the session was minted WITH MFA,
+#    so the policy's explicit deny lifts
+aws sts get-caller-identity --profile copilot-session
+aws s3api list-buckets --profile copilot-session --query 'Buckets[0].Name'
+```
+
+Then point the server at the session profile
+(`DEVOPS_COPILOT_PROFILES=copilot-session` in the client `env` block).
+When credentials expire, tool errors tell you exactly which command to rerun.
+
+## Testing with MCP Inspector
+
+Poke any tool by hand from a browser UI. Note the `-e` flags — the Inspector
+does **not** forward your shell environment to the spawned server:
+
+```bash
+npx @modelcontextprotocol/inspector \
+  -e DEVOPS_COPILOT_PROFILES=<profile> \
+  -e AWS_REGION=ap-south-1 \
+  node dist/core/server.js
+```
+
+After connecting, call `list_accounts` first to confirm the server sees only
+the profile you intended.
+
 ## Development
 
 ```bash
