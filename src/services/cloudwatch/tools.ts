@@ -9,6 +9,7 @@ import {
   type StateValue,
   type Statistic,
 } from "@aws-sdk/client-cloudwatch";
+import { CloudWatchLogsClient, FilterLogEventsCommand, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
 import { z } from "zod";
 import type { ToolDefinition, ToolContext } from "../../core/types.js";
 import type { AwsClientFactory } from "../../core/aws-client.js";
@@ -30,8 +31,76 @@ function parseDimensions(dims?: string[]): { Name: string; Value: string }[] | u
  */
 export function buildCloudWatchTools(factory: AwsClientFactory): ToolDefinition[] {
   const cw = (ctx: ToolContext) => factory.getClient(CloudWatchClient, ctx.accountId, ctx.region).client;
+  const logs = (ctx: ToolContext) => factory.getClient(CloudWatchLogsClient, ctx.accountId, ctx.region).client;
 
   return [
+    {
+      name: "list_log_groups",
+      description: "List CloudWatch log groups, optionally filtered by name prefix, with retention and size.",
+      risk: "read",
+      inputSchema: {
+        namePrefix: z.string().max(512).optional().describe("Log group name prefix, e.g. '/aws/lambda/'"),
+        limit: z.number().int().min(1).max(50).optional().describe("Max groups to return (default 25)"),
+      },
+      handler: async (args, ctx) => {
+        const res = await logs(ctx).send(
+          new DescribeLogGroupsCommand({
+            logGroupNamePrefix: args.namePrefix as string | undefined,
+            limit: (args.limit as number | undefined) ?? 25,
+          }),
+        );
+        const groups = res.logGroups ?? [];
+        return {
+          count: groups.length,
+          truncated: Boolean(res.nextToken),
+          logGroups: groups.map((g) => ({
+            name: g.logGroupName,
+            retentionDays: g.retentionInDays ?? "never expires",
+            storedMB: g.storedBytes != null ? Number((g.storedBytes / 1e6).toFixed(1)) : undefined,
+          })),
+        };
+      },
+    },
+    {
+      name: "tail_log_group",
+      description:
+        "Fetch recent events from a CloudWatch log group (like `tail`), optionally filtered by a pattern (e.g. 'ERROR' or '?timeout ?Timeout'). Messages are truncated to 500 chars each.",
+      risk: "read",
+      inputSchema: {
+        logGroup: z.string().max(512).describe("Log group name, e.g. '/aws/lambda/my-fn'"),
+        minutes: z.number().int().min(1).max(1440).optional().describe("Look-back window in minutes (default 15)"),
+        filterPattern: z
+          .string()
+          .max(1024)
+          .optional()
+          .describe("CloudWatch Logs filter pattern, e.g. 'ERROR' — omit for all events"),
+        limit: z.number().int().min(1).max(200).optional().describe("Max events to return (default 50)"),
+      },
+      handler: async (args, ctx) => {
+        const minutes = (args.minutes as number | undefined) ?? 15;
+        const res = await logs(ctx).send(
+          new FilterLogEventsCommand({
+            logGroupName: args.logGroup as string,
+            startTime: Date.now() - minutes * 60_000,
+            filterPattern: args.filterPattern as string | undefined,
+            limit: (args.limit as number | undefined) ?? 50,
+          }),
+        );
+        const events = res.events ?? [];
+        return {
+          logGroup: args.logGroup,
+          windowMinutes: minutes,
+          count: events.length,
+          truncated: Boolean(res.nextToken),
+          events: events.map((e) => ({
+            time: e.timestamp ? new Date(e.timestamp).toISOString() : undefined,
+            stream: e.logStreamName,
+            // Hard cap per message: raw app logs can be huge and would flood the LLM context.
+            message: (e.message ?? "").slice(0, 500),
+          })),
+        };
+      },
+    },
     {
       name: "list_alarms",
       description:

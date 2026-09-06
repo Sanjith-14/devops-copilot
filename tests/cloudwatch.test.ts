@@ -16,6 +16,8 @@ describe("CloudWatch module contract", () => {
   it("exposes the expected tools", () => {
     expect(mod.name).toBe("cloudwatch");
     expect(mod.tools.map((t) => t.name)).toEqual([
+      "list_log_groups",
+      "tail_log_group",
       "list_alarms",
       "get_alarm_history",
       "list_metrics",

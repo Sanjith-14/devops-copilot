@@ -1,4 +1,4 @@
-# DevOps Copilot 🛠️
+# DevOps Copilot
 
 An **extensible, multi-account MCP server** that lets LLMs (Claude Desktop or any
 [Model Context Protocol](https://modelcontextprotocol.io) client) safely operate on AWS
