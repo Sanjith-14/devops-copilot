@@ -1,10 +1,12 @@
-import { readdirSync, existsSync } from "node:fs";
+import { readdirSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ServiceModule, CopilotConfig, ToolContext } from "./types.js";
+import type { ServiceModule, CopilotConfig, ToolContext, ToolDefinition } from "./types.js";
 import { AwsClientFactory } from "./aws-client.js";
+import { loadMarkdownTools, parseModuleMarkdown } from "./md-tools.js";
+import { loadSdkCommand } from "./aws-ops.js";
 import { Guardrails, GuardrailViolation } from "./guardrails.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -26,19 +28,60 @@ export async function discoverModules(cfg: CopilotConfig, factory: AwsClientFact
       console.error(`[registry] skipping disabled module "${entry.name}"`);
       continue;
     }
-    const modPath = join(servicesDir, entry.name, "index.js");
-    if (!existsSync(modPath)) continue;
-    const imported = await import(modPath);
-    const create = imported.default as ((f: AwsClientFactory) => ServiceModule) | undefined;
-    const mod = typeof create === "function" ? create(factory) : undefined;
-    if (!mod?.name || !Array.isArray(mod.tools)) {
-      console.error(`[registry] ${entry.name}/index.js does not default-export a ServiceModule, skipping`);
+    const dir = join(servicesDir, entry.name);
+    const modPath = join(dir, "index.js");
+    const mdTools = await loadMarkdownTools(dir, factory);
+
+    let mod: ServiceModule | undefined;
+    if (existsSync(modPath)) {
+      const imported = await import(modPath);
+      const create = imported.default as ((f: AwsClientFactory) => ServiceModule) | undefined;
+      mod = typeof create === "function" ? create(factory) : undefined;
+      if (!mod?.name || !Array.isArray(mod.tools)) {
+        console.error(`[registry] ${entry.name}/index.js does not default-export a ServiceModule, skipping`);
+        continue;
+      }
+      mod.tools.push(...mdTools);
+    } else if (mdTools.length > 0) {
+      // Markdown-only module: no TypeScript at all.
+      mod = markdownOnlyModule(entry.name, dir, mdTools, factory);
+    } else {
       continue;
     }
     modules.push(mod);
     console.error(`[registry] loaded module "${mod.name}" (${mod.tools.length} tools)`);
   }
   return modules;
+}
+
+/** Build a ServiceModule for a folder that only contains `*.tool.md` (+ optional module.md). */
+function markdownOnlyModule(
+  name: string,
+  dir: string,
+  tools: ToolDefinition[],
+  factory: AwsClientFactory,
+): ServiceModule {
+  const metaPath = join(dir, "module.md");
+  const meta = existsSync(metaPath)
+    ? parseModuleMarkdown(readFileSync(metaPath, "utf8"), `${name}/module.md`)
+    : { description: `${name} (markdown tools)` };
+  return {
+    name,
+    description: meta.description,
+    tools,
+    healthCheck: async (ctx) => {
+      if (!meta.health) return { ok: true, detail: "no health check defined in module.md" };
+      try {
+        const { Client, Command } = await loadSdkCommand(meta.health.service, meta.health.operation);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { client } = factory.getClient(Client as any, ctx.accountId, ctx.region);
+        await (client as { send(c: unknown): Promise<unknown> }).send(new Command(meta.health.params ?? {}));
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, detail: String(err) };
+      }
+    },
+  };
 }
 
 /**
