@@ -16,6 +16,7 @@ import type { CopilotConfig } from "./types.js";
  *                                   that cannot ask the user interactively
  *   DEVOPS_COPILOT_ALLOW_DESTRUCTIVE "true" + interactive confirmation
  *                                   required for destructive tools
+ *   DEVOPS_COPILOT_TIMEOUT_MS       per-tool-call timeout (default 30000)
  *   AWS_REGION                      fallback region (default us-east-1)
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): CopilotConfig {
@@ -33,5 +34,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CopilotConfig 
     allowDestructive: env.DEVOPS_COPILOT_ALLOW_DESTRUCTIVE === "true",
     profileAllowlist: csv(env.DEVOPS_COPILOT_PROFILES),
     enabledServices: services && services.length > 0 ? services : "*",
+    toolTimeoutMs: Number(env.DEVOPS_COPILOT_TIMEOUT_MS) > 0 ? Number(env.DEVOPS_COPILOT_TIMEOUT_MS) : 30_000,
   };
 }

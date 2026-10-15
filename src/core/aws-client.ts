@@ -1,7 +1,29 @@
 import { fromIni } from "@aws-sdk/credential-providers";
 import { loadSharedConfigFiles } from "@smithy/shared-ini-file-loader";
-import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
+import type { AwsCredentialIdentity, AwsCredentialIdentityProvider } from "@aws-sdk/types";
 import type { AccountConfig, CopilotConfig } from "./types.js";
+
+/** Asks the human for an MFA code (wired to MCP elicitation by the server). */
+export type MfaCodeProvider = (serial: string, purpose: string) => Promise<string>;
+
+/**
+ * Cache a credential provider's result until 5 minutes before expiry, with
+ * one in-flight refresh at a time — so an MFA-protected profile prompts once,
+ * not once per concurrent API call.
+ */
+export function memoizeCredentials(provider: AwsCredentialIdentityProvider): AwsCredentialIdentityProvider {
+  let current: AwsCredentialIdentity | undefined;
+  let inflight: Promise<AwsCredentialIdentity> | undefined;
+  return async () => {
+    if (current && (!current.expiration || current.expiration.getTime() - Date.now() > 5 * 60_000)) return current;
+    inflight ??= provider()
+      .then((c) => (current = c))
+      .finally(() => {
+        inflight = undefined;
+      });
+    return inflight;
+  };
+}
 
 /**
  * Central factory for AWS SDK v3 clients.
@@ -26,8 +48,30 @@ export class AwsClientFactory {
   /** Runtime credential providers for ephemeral (assumed-role) accounts. */
   private ephemeralCreds = new Map<string, AwsCredentialIdentityProvider>();
   private defaultAccountId = "default";
+  /** Raw ~/.aws config sections per profile (role_arn, mfa_serial, source_profile, ...). */
+  private sections = new Map<string, Record<string, string | undefined>>();
+  private mfaCodeProvider: MfaCodeProvider = async (serial) => {
+    throw new Error(
+      `MFA code required for ${serial}, but this client cannot prompt. ` +
+        "Run `devops-copilot login --profile <name>` in a terminal first.",
+    );
+  };
 
   constructor(private cfg: CopilotConfig) {}
+
+  /** The server installs an interactive (elicitation-based) MFA prompt here. */
+  setMfaCodeProvider(provider: MfaCodeProvider): void {
+    this.mfaCodeProvider = provider;
+  }
+
+  getMfaCodeProvider(): MfaCodeProvider {
+    return this.mfaCodeProvider;
+  }
+
+  /** ~/.aws settings for a discovered profile (empty for ephemeral accounts). */
+  profileConfig(accountId: string): Record<string, string | undefined> {
+    return this.sections.get(accountId) ?? {};
+  }
 
   /**
    * Scan ~/.aws/config + ~/.aws/credentials and register every profile as an
@@ -40,12 +84,13 @@ export class AwsClientFactory {
     for (const name of names) {
       if (this.cfg.profileAllowlist && !this.cfg.profileAllowlist.includes(name)) continue;
       const section = { ...(credentialsFile?.[name] ?? {}), ...(configFile?.[name] ?? {}) };
+      this.sections.set(name, section);
       this.accounts.set(name, {
         id: name,
         profile: name,
         defaultRegion: section.region,
         description: section.role_arn
-          ? `AssumeRole via profile (${section.role_arn})`
+          ? `AssumeRole via profile (${section.role_arn})${section.mfa_serial ? " + MFA" : ""}`
           : section.sso_account_id || section.sso_session
             ? `SSO${section.sso_account_id ? ` account ${section.sso_account_id}` : ""}${section.sso_role_name ? ` / ${section.sso_role_name}` : ""}`
             : "local credentials",
@@ -73,13 +118,25 @@ export class AwsClientFactory {
     }
   }
 
-  /** Register a runtime (session-scoped) account backed by an explicit credential provider. */
-  registerEphemeralAccount(account: AccountConfig, credentials: AwsCredentialIdentityProvider): void {
+  /**
+   * Register a runtime (session-scoped) account backed by an explicit
+   * credential provider. `replace` re-registers an existing *ephemeral*
+   * account (e.g. re-assuming a role); discovered profiles are never replaced.
+   */
+  registerEphemeralAccount(
+    account: AccountConfig,
+    credentials: AwsCredentialIdentityProvider,
+    opts: { replace?: boolean } = {},
+  ): void {
     if (this.accounts.has(account.id)) {
-      throw new Error(`Account id "${account.id}" already exists — pick a different label.`);
+      if (!(opts.replace && this.ephemeralCreds.has(account.id))) {
+        throw new Error(`Account id "${account.id}" already exists — pick a different label.`);
+      }
+      // Drop clients bound to the old credentials.
+      for (const key of [...this.clientCache.keys()]) if (key.includes(`:${account.id}:`)) this.clientCache.delete(key);
     }
     this.accounts.set(account.id, account);
-    this.ephemeralCreds.set(account.id, credentials);
+    this.ephemeralCreds.set(account.id, memoizeCredentials(credentials));
   }
 
   listAccounts(): AccountConfig[] {
@@ -110,10 +167,26 @@ export class AwsClientFactory {
 
     let creds = this.credCache.get(account.id);
     if (!creds) {
-      creds = fromIni({ profile: account.profile });
+      // Profiles with role_arn + mfa_serial ask the user for a code via the
+      // server's MFA prompt (MCP elicitation) instead of failing.
+      creds = memoizeCredentials(
+        fromIni({
+          profile: account.profile,
+          mfaCodeProvider: (serial: string) => this.mfaCodeProvider(serial, `profile "${account.profile}"`),
+        }),
+      );
       this.credCache.set(account.id, creds);
     }
     return creds;
+  }
+
+  /**
+   * Resolve credentials up front (may prompt for MFA). The registry calls
+   * this before starting a tool's timeout so a human typing a code isn't
+   * counted against it.
+   */
+  async ensureCredentials(account: AccountConfig): Promise<void> {
+    await this.credentialsFor(account)();
   }
 
   /**

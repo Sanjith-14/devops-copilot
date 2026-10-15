@@ -8,6 +8,9 @@ import { AwsClientFactory } from "./aws-client.js";
 import { loadMarkdownTools, parseModuleMarkdown } from "./md-tools.js";
 import { loadSdkCommand } from "./aws-ops.js";
 import { Guardrails, GuardrailViolation } from "./guardrails.js";
+import { askMfaCode, audit, canElicit, confirmWithUser, executeTool, outcomeOf, withLoginHint } from "./runner.js";
+import { registerRoleTools } from "./role-tools.js";
+import { registerPrompts } from "./prompts.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -84,48 +87,51 @@ function markdownOnlyModule(
   };
 }
 
+/** Core-injected params: every service tool can target any account/region. */
+const targetParams = {
+  account: z.string().optional().describe("Account id from list_accounts. Omit to use the default account."),
+  region: z.string().optional().describe("AWS region override. Omit to use the account/server default."),
+};
+
+const asText = (obj: unknown, isError = false) => ({
+  content: [{ type: "text" as const, text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) }],
+  ...(isError ? { isError: true } : {}),
+});
+
 /**
  * Registers every tool from every module onto the MCP server, wrapping each
- * handler with: account/region resolution -> guardrail check -> execution ->
- * account/region tagging of the result.
+ * handler with: account/region resolution -> guardrail check -> credentials
+ * (MFA prompt if needed) -> execution under a timeout -> account/region
+ * tagging of the result -> one audit log line.
  */
 export function registerModules(
   server: McpServer,
   modules: ServiceModule[],
   factory: AwsClientFactory,
   guardrails: Guardrails,
+  timeoutMs = 30_000,
 ): void {
   for (const mod of modules) {
     for (const tool of mod.tools) {
       const fullName = `${mod.name}_${tool.name}`;
 
-      // Core injects account/region params into every tool so the LLM can
-      // target any registered account. Modules never see this plumbing.
-      const schema = {
-        ...tool.inputSchema,
-        account: z
-          .string()
-          .optional()
-          .describe("Account id from list_accounts. Omit to use the default account."),
-        region: z.string().optional().describe("AWS region override. Omit to use the account/server default."),
-      };
-
       server.registerTool(
         fullName,
         {
           description: `[${tool.risk.toUpperCase()}] ${tool.description}`,
-          inputSchema: schema,
+          inputSchema: { ...tool.inputSchema, ...targetParams },
         },
         async (args: Record<string, unknown>) => {
+          const started = Date.now();
+          let ctx: ToolContext | undefined;
           try {
             const account = factory.resolveAccount(args.account as string | undefined);
             const region = factory.resolveRegion(account, args.region as string | undefined);
-            const ctx: ToolContext = { accountId: account.id, region };
+            ctx = { accountId: account.id, region };
 
             // Guardrails: the verdict may require the USER (not the LLM) to
             // approve this call, via an MCP elicitation request to the client.
-            const canConfirm = Boolean(server.server.getClientCapabilities()?.elicitation);
-            const { verdict, reason } = guardrails.decide(tool.risk, canConfirm);
+            const { verdict, reason } = guardrails.decide(tool.risk, canElicit(server));
             if (verdict === "deny") throw new GuardrailViolation(reason ?? "Blocked by guardrails.");
             if (verdict === "confirm") {
               await confirmWithUser(
@@ -134,15 +140,25 @@ export function registerModules(
               );
             }
 
-            const result = await tool.handler(args, ctx);
+            const result = await executeTool(fullName, tool, args, account, ctx, factory, timeoutMs);
+            audit({ tool: fullName, account: ctx.accountId, region: ctx.region, risk: tool.risk, args, ms: Date.now() - started, outcome: "ok" });
 
             // Every response is tagged with its origin. Critical when results
             // from multiple accounts are merged into one LLM context.
-            const tagged = { _account: ctx.accountId, _region: ctx.region, ...result };
-            return { content: [{ type: "text" as const, text: JSON.stringify(tagged, null, 2) }] };
+            return asText({ _account: ctx.accountId, _region: ctx.region, ...result });
           } catch (err) {
+            audit({
+              tool: fullName,
+              account: ctx?.accountId ?? (args.account as string | undefined),
+              region: ctx?.region,
+              risk: tool.risk,
+              args,
+              ms: Date.now() - started,
+              outcome: outcomeOf(err),
+              error: err,
+            });
             const message = err instanceof GuardrailViolation ? err.message : `Error in ${fullName}: ${String(err)}`;
-            return { content: [{ type: "text" as const, text: withLoginHint(message) }], isError: true };
+            return asText(withLoginHint(message), true);
           }
         },
       );
@@ -150,40 +166,20 @@ export function registerModules(
   }
 }
 
-/**
- * Append a login instruction to credential-expiry errors so the LLM can tell
- * the user exactly what to run — instead of surfacing a bare SDK error.
- */
-function withLoginHint(message: string): string {
-  if (/sso.*(expired|invalid|token)/i.test(message) || /SSOTokenProviderFailure/.test(message)) {
-    return `${message}\nHint: the SSO session has expired — ask the user to run \`aws sso login --profile <profile>\` in a terminal, then retry.`;
-  }
-  if (/ExpiredToken|token.*expired|credentials.*expired/i.test(message)) {
-    return `${message}\nHint: temporary credentials have expired — ask the user to re-run \`devops-copilot login --profile <profile>\` (or their usual AWS login) in a terminal, then retry.`;
-  }
-  return message;
-}
-
-/**
- * Ask the human user (via MCP elicitation — client UI, not the LLM) to
- * approve an action. Throws GuardrailViolation unless explicitly approved.
- */
-async function confirmWithUser(server: McpServer, message: string): Promise<void> {
-  const res = await server.server.elicitInput({
-    message,
-    requestedSchema: {
-      type: "object",
-      properties: { approve: { type: "boolean", title: "Approve this operation?" } },
-      required: ["approve"],
-    },
-  });
-  if (res.action !== "accept" || (res.content as { approve?: boolean } | undefined)?.approve !== true) {
-    throw new GuardrailViolation("The user declined this operation.");
-  }
-}
+/** Max characters of one account's result inside run_across_accounts. */
+const PER_ACCOUNT_CHARS = 8_000;
 
 /** Core tools that exist regardless of which service modules are loaded. */
-export function registerCoreTools(server: McpServer, modules: ServiceModule[], factory: AwsClientFactory): void {
+export function registerCoreTools(
+  server: McpServer,
+  modules: ServiceModule[],
+  factory: AwsClientFactory,
+  timeoutMs = 30_000,
+): void {
+  // MFA-protected ~/.aws profiles (role_arn + mfa_serial) prompt the user in
+  // the client UI instead of failing.
+  factory.setMfaCodeProvider((serial, purpose) => askMfaCode(server, serial, `use ${purpose}`));
+
   server.registerTool(
     "list_accounts",
     {
@@ -191,100 +187,18 @@ export function registerCoreTools(server: McpServer, modules: ServiceModule[], f
         "[READ] List usable AWS accounts: profiles auto-discovered from ~/.aws plus any roles assumed this session. Marks the default.",
       inputSchema: {},
     },
-    async () => ({
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            factory.listAccounts().map((a) => ({
-              id: a.id,
-              description: a.description ?? "",
-              region: a.defaultRegion,
-              default: a.id === factory.defaultAccount() || undefined,
-            })),
-            null,
-            2,
-          ),
-        },
-      ],
-    }),
+    async () =>
+      asText(
+        factory.listAccounts().map((a) => ({
+          id: a.id,
+          description: a.description ?? "",
+          region: a.defaultRegion,
+          default: a.id === factory.defaultAccount() || undefined,
+        })),
+      ),
   );
 
-  server.registerTool(
-    "assume_role",
-    {
-      description:
-        "[READ] Assume an IAM role via STS and register it as a temporary account for this session (usable via the `account` parameter of every tool). Requires interactive user approval. Access is bounded by the role's trust policy — this cannot grant anything AWS itself would refuse.",
-      inputSchema: {
-        roleArn: z.string().max(2048).describe("ARN of the role to assume, e.g. arn:aws:iam::123456789012:role/ReadOnly"),
-        label: z
-          .string()
-          .max(64)
-          .describe("Short account id to register it under, e.g. 'prod-readonly'. Used as the `account` parameter."),
-        sourceAccount: z
-          .string()
-          .optional()
-          .describe("Existing account id whose credentials perform the AssumeRole call. Omit for the default account."),
-        region: z.string().optional().describe("Default region for the new account. Omit to inherit."),
-      },
-    },
-    async (args: { roleArn: string; label: string; sourceAccount?: string; region?: string }) => {
-      try {
-        if (!server.server.getClientCapabilities()?.elicitation) {
-          throw new GuardrailViolation(
-            "assume_role requires interactive user approval, but this MCP client does not support elicitation. " +
-              "Add a profile with role_arn/source_profile to ~/.aws/config instead.",
-          );
-        }
-        const source = factory.resolveAccount(args.sourceAccount);
-        await confirmWithUser(
-          server,
-          `Assume IAM role ${args.roleArn} (as account "${args.label}") using credentials of "${source.id}"?`,
-        );
-
-        const { fromTemporaryCredentials } = await import("@aws-sdk/credential-providers");
-        const region = args.region ?? factory.resolveRegion(source);
-        const credentials = fromTemporaryCredentials({
-          masterCredentials: factory.credentialsFor(source),
-          params: { RoleArn: args.roleArn, RoleSessionName: "devops-copilot", DurationSeconds: 3600 },
-          clientConfig: { region },
-        });
-
-        // Prove the role actually works before registering it.
-        const { STSClient, GetCallerIdentityCommand } = await import("@aws-sdk/client-sts");
-        const identity = await new STSClient({ region, credentials }).send(new GetCallerIdentityCommand({}));
-
-        factory.registerEphemeralAccount(
-          {
-            id: args.label,
-            profile: "",
-            defaultRegion: region,
-            description: `Assumed role ${args.roleArn} (session-scoped, via ${source.id})`,
-          },
-          credentials,
-        );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  registered: args.label,
-                  identity: { account: identity.Account, arn: identity.Arn },
-                  note: "Session-scoped: gone when the server restarts. Use it via the `account` parameter.",
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      } catch (err) {
-        const message = err instanceof GuardrailViolation ? err.message : `Error in assume_role: ${String(err)}`;
-        return { content: [{ type: "text" as const, text: message }], isError: true };
-      }
-    },
-  );
+  registerRoleTools(server, factory);
 
   server.registerTool(
     "list_modules",
@@ -292,22 +206,14 @@ export function registerCoreTools(server: McpServer, modules: ServiceModule[], f
       description: "[READ] List loaded service modules and the tools each exposes, with risk levels.",
       inputSchema: {},
     },
-    async () => ({
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            modules.map((m) => ({
-              module: m.name,
-              description: m.description,
-              tools: m.tools.map((t) => ({ name: `${m.name}_${t.name}`, risk: t.risk })),
-            })),
-            null,
-            2,
-          ),
-        },
-      ],
-    }),
+    async () =>
+      asText(
+        modules.map((m) => ({
+          module: m.name,
+          description: m.description,
+          tools: m.tools.map((t) => ({ name: `${m.name}_${t.name}`, risk: t.risk })),
+        })),
+      ),
   );
 
   server.registerTool(
@@ -333,14 +239,86 @@ export function registerCoreTools(server: McpServer, modules: ServiceModule[], f
           }
         }),
       );
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ _account: ctx.accountId, _region: ctx.region, results }, null, 2),
-          },
-        ],
-      };
+      return asText({ _account: ctx.accountId, _region: ctx.region, results });
     },
   );
+
+  // Fan-out: one READ tool, many accounts, partial results.
+  const toolIndex = new Map<string, ToolDefinition>();
+  for (const m of modules) for (const t of m.tools) toolIndex.set(`${m.name}_${t.name}`, t);
+
+  server.registerTool(
+    "run_across_accounts",
+    {
+      description:
+        "[READ] Run one READ-only tool against several (default: all) accounts in parallel and get every result " +
+        "side by side, e.g. tool 'security_scorecard' or 'ec2_find_open_security_groups' across all accounts. " +
+        "Accounts that fail (no permission, expired login) are reported individually; the rest still return.",
+      inputSchema: {
+        tool: z.string().max(128).describe("Full tool name, e.g. 's3_list_buckets' (see list_modules)"),
+        args: z.record(z.unknown()).optional().describe("Arguments for that tool (without account)"),
+        accounts: z.array(z.string()).max(50).optional().describe("Account ids from list_accounts. Omit for all."),
+        region: z.string().optional().describe("Region for every account. Omit for each account's default."),
+      },
+    },
+    async (input: { tool: string; args?: Record<string, unknown>; accounts?: string[]; region?: string }) => {
+      const started = Date.now();
+      try {
+        const tool = toolIndex.get(input.tool);
+        if (!tool) {
+          const near = [...toolIndex.keys()].filter((n) => n.includes(input.tool.split("_").pop() ?? "")).slice(0, 8);
+          throw new Error(`Unknown tool "${input.tool}".${near.length ? ` Did you mean: ${near.join(", ")}?` : ""}`);
+        }
+        if (tool.risk !== "read") {
+          throw new GuardrailViolation(`run_across_accounts only runs READ tools; "${input.tool}" is ${tool.risk.toUpperCase()}.`);
+        }
+        const targets = input.accounts ?? factory.listAccounts().map((a) => a.id);
+        const args = { ...(input.args ?? {}) };
+        delete args.account;
+
+        // Resolve credentials one account at a time so MFA prompts don't stack up.
+        const credErrors = new Map<string, unknown>();
+        for (const id of targets) {
+          try {
+            await factory.ensureCredentials(factory.resolveAccount(id));
+          } catch (err) {
+            credErrors.set(id, err);
+          }
+        }
+
+        const settled = await Promise.allSettled(
+          targets.map(async (id) => {
+            if (credErrors.has(id)) throw credErrors.get(id);
+            const account = factory.resolveAccount(id);
+            const ctx: ToolContext = { accountId: account.id, region: factory.resolveRegion(account, input.region) };
+            return { ctx, result: await executeTool(input.tool, tool, args, account, ctx, factory, timeoutMs) };
+          }),
+        );
+
+        const results = settled.map((s, i) => {
+          if (s.status === "rejected") {
+            return { account: targets[i], ok: false, error: withLoginHint(String(s.reason)).slice(0, 500) };
+          }
+          const json = JSON.stringify(s.value.result);
+          return {
+            account: targets[i],
+            region: s.value.ctx.region,
+            ok: true,
+            ...(json.length > PER_ACCOUNT_CHARS
+              ? { truncatedResult: json.slice(0, PER_ACCOUNT_CHARS), note: "result cut — call the tool directly for this account" }
+              : { result: s.value.result }),
+          };
+        });
+        const succeeded = results.filter((r) => r.ok).length;
+        audit({ tool: `run_across_accounts:${input.tool}`, risk: "read", args, ms: Date.now() - started, outcome: succeeded ? "ok" : "error" });
+        return asText({ tool: input.tool, accounts: targets.length, succeeded, failed: targets.length - succeeded, results });
+      } catch (err) {
+        audit({ tool: `run_across_accounts:${input.tool}`, risk: "read", ms: Date.now() - started, outcome: outcomeOf(err), error: err });
+        const message = err instanceof GuardrailViolation ? err.message : `Error in run_across_accounts: ${String(err)}`;
+        return asText(message, true);
+      }
+    },
+  );
+
+  registerPrompts(server, new Set(toolIndex.keys()));
 }

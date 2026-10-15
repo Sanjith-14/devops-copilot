@@ -10,7 +10,7 @@ export type RiskLevel = "read" | "mutate" | "destructive";
 
 /** Context passed to every tool handler by the core. */
 export interface ToolContext {
-  /** Resolved account id (from the account registry in config.yaml). */
+  /** Resolved account id (a discovered ~/.aws profile or an assumed-role label). */
   accountId: string;
   /** Resolved AWS region for this call. */
   region: string;
@@ -82,4 +82,6 @@ export interface CopilotConfig {
   profileAllowlist?: string[];
   /** Which service modules to load. "*" = all discovered. */
   enabledServices: string[] | "*";
+  /** Per-tool-call timeout in ms (default 30000). Credential/MFA prompts are not counted. */
+  toolTimeoutMs?: number;
 }

@@ -1,6 +1,7 @@
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
 import type { ServiceModule, ServiceModuleFactory } from "../../core/types.js";
 import { buildCostTools } from "./tools.js";
+import { buildWasteTools } from "./waste.js";
 
 /**
  * Cost service module (read-only): daily spend breakdowns plus cost-anomaly
@@ -11,8 +12,8 @@ const createCostModule: ServiceModuleFactory = (factory) => {
   const mod: ServiceModule = {
     name: "cost",
     description:
-      "AWS spend: daily cost by service, statistical spend-spike alerts, and AWS Cost Anomaly Detection results (read-only).",
-    tools: buildCostTools(factory),
+      "AWS spend: daily cost by service, statistical spend-spike alerts, AWS Cost Anomaly Detection results, and a waste finder for unused resources (read-only).",
+    tools: [...buildCostTools(factory), ...buildWasteTools(factory)],
     healthCheck: async (ctx) => {
       try {
         // Cost Explorer is global; always served from us-east-1.

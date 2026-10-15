@@ -31,7 +31,7 @@ describe("Cost module contract", () => {
 
   it("exposes the expected tools", () => {
     expect(mod.name).toBe("cost");
-    expect(mod.tools.map((t) => t.name)).toEqual(["daily_spend", "detect_spend_spikes", "get_aws_anomalies"]);
+    expect(mod.tools.map((t) => t.name)).toEqual(["daily_spend", "detect_spend_spikes", "get_aws_anomalies", "find_waste"]);
   });
 
   it("is read-only: every tool declares read risk", () => {

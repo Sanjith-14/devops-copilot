@@ -33,10 +33,11 @@ async function main(): Promise<void> {
   const server = new McpServer({ name: "devops-copilot", version: "0.1.0" });
 
   const modules = await discoverModules(cfg, factory);
-  registerCoreTools(server, modules, factory);
-  registerModules(server, modules, factory, guardrails);
+  registerCoreTools(server, modules, factory, cfg.toolTimeoutMs);
+  registerModules(server, modules, factory, guardrails, cfg.toolTimeoutMs);
 
-  const totalTools = modules.reduce((n, m) => n + m.tools.length, 0) + 4;
+  const CORE_TOOLS = 6; // list_accounts, list_assumable_roles, assume_role, list_modules, health_check, run_across_accounts
+  const totalTools = modules.reduce((n, m) => n + m.tools.length, 0) + CORE_TOOLS;
   const accounts = factory.listAccounts();
   console.error(
     `[server] devops-copilot ready: ${modules.length} module(s), ${totalTools} tool(s), ` +

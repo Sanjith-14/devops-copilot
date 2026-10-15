@@ -3,12 +3,18 @@ import {
   DescribeLoadBalancersCommand,
   DescribeTargetGroupsCommand,
   DescribeTargetHealthCommand,
+  DescribeListenersCommand,
+  DescribeRulesCommand,
+  type Rule,
   type Action,
   type RuleCondition,
   type TargetGroup,
   type LoadBalancer,
   type RedirectActionConfig,
 } from "@aws-sdk/client-elastic-load-balancing-v2";
+import { mapLimited } from "../../core/helpers.js";
+
+export { mapLimited };
 
 /** "arn:...:targetgroup/api-tg/abc123" -> "api-tg" (also works for loadbalancer ARNs). */
 export const nameFromArn = (arn?: string) => {
@@ -75,12 +81,6 @@ export const targetGroupArns = (actions: Action[] | undefined): string[] =>
     a.Type !== "forward" ? [] : a.ForwardConfig?.TargetGroups?.map((g) => g.TargetGroupArn!) ?? [a.TargetGroupArn!],
   ).filter(Boolean);
 
-/** Run async work over items with bounded concurrency (be nice to API rate limits). */
-export async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = [];
-  for (let i = 0; i < items.length; i += limit) out.push(...(await Promise.all(items.slice(i, i + limit).map(fn))));
-  return out;
-}
 
 export async function allTargetGroups(client: ElasticLoadBalancingV2Client): Promise<TargetGroup[]> {
   const groups: TargetGroup[] = [];
@@ -139,5 +139,90 @@ export async function findLoadBalancersForTarget(client: ElasticLoadBalancingV2C
         };
       }),
     ),
+  };
+}
+
+/**
+ * Full routing map of one load balancer: listeners -> rules -> target groups
+ * -> targets with health. Shared by elb_map_load_balancer and the Route 53
+ * domain trace.
+ */
+export async function mapLoadBalancer(client: ElasticLoadBalancingV2Client, name: string) {
+  const lbRes = await client.send(new DescribeLoadBalancersCommand({ Names: [name] }));
+  const lb = lbRes.LoadBalancers?.[0];
+  if (!lb) throw new Error(`Load balancer "${name}" not found.`);
+
+  const listeners =
+    (await client.send(new DescribeListenersCommand({ LoadBalancerArn: lb.LoadBalancerArn }))).Listeners ?? [];
+
+  // Rules exist only for HTTP/HTTPS (ALB) listeners; NLB listeners have just a default action.
+  const listenerViews = await mapLimited(listeners, 5, async (l) => {
+    let rules: Rule[] = [];
+    if (l.Protocol === "HTTP" || l.Protocol === "HTTPS") {
+      rules = (await client.send(new DescribeRulesCommand({ ListenerArn: l.ListenerArn }))).Rules ?? [];
+    }
+    const ordered = [...rules].sort(
+      (a, b) => (a.IsDefault ? 1 : 0) - (b.IsDefault ? 1 : 0) || Number(a.Priority) - Number(b.Priority),
+    );
+    return {
+      listener: l,
+      tgArns: [...targetGroupArns(l.DefaultActions), ...rules.flatMap((r) => targetGroupArns(r.Actions))],
+      view: {
+        port: l.Port,
+        protocol: l.Protocol,
+        certificates: l.Certificates?.map((c) => c.CertificateArn),
+        rules: ordered.length
+          ? ordered.map((r) => ({
+              priority: r.Priority,
+              when: describeConditions(r.Conditions),
+              then: (r.Actions ?? []).map(describeAction).join("; "),
+            }))
+          : [{ priority: "default", when: "default (no conditions)", then: (l.DefaultActions ?? []).map(describeAction).join("; ") }],
+      },
+    };
+  });
+
+  const tgArns = [...new Set(listenerViews.flatMap((v) => v.tgArns))];
+  const groups = [];
+  for (let i = 0; i < tgArns.length; i += 20) {
+    const res = await client.send(new DescribeTargetGroupsCommand({ TargetGroupArns: tgArns.slice(i, i + 20) }));
+    groups.push(...(res.TargetGroups ?? []));
+  }
+  const targetGroups = await mapLimited(groups, 10, async (g) => {
+    const health = (await client.send(new DescribeTargetHealthCommand({ TargetGroupArn: g.TargetGroupArn })))
+      .TargetHealthDescriptions ?? [];
+    const targets = health.map((d) => ({
+      id: d.Target?.Id,
+      port: d.Target?.Port,
+      state: d.TargetHealth?.State,
+      reason: d.TargetHealth?.Reason,
+    }));
+    return {
+      name: g.TargetGroupName,
+      protocol: g.Protocol,
+      port: g.Port,
+      targetType: g.TargetType,
+      healthCheck: `${g.HealthCheckProtocol ?? ""} ${g.HealthCheckPort ?? ""} ${g.HealthCheckPath ?? ""}`.trim(),
+      healthy: targets.filter((t) => t.state === "healthy").length,
+      unhealthy: targets.filter((t) => t.state === "unhealthy").length,
+      targets,
+    };
+  });
+
+  return {
+    loadBalancer: {
+      name: lb.LoadBalancerName,
+      type: lb.Type,
+      scheme: lb.Scheme,
+      state: lb.State?.Code,
+      dns: lb.DNSName,
+      vpcId: lb.VpcId,
+      securityGroups: lb.SecurityGroups,
+    },
+    listeners: listenerViews.map((v) => v.view),
+    targetGroups,
+    warnings: targetGroups
+      .filter((g) => g.targets.length === 0 || g.unhealthy > 0)
+      .map((g) => (g.targets.length === 0 ? `${g.name}: no registered targets` : `${g.name}: ${g.unhealthy} unhealthy target(s)`)),
   };
 }
