@@ -30,8 +30,9 @@ through natural language.
   | `cloudwatch`, `monitor`, `asg` | alarms, metrics, logs, scaling groups |
   | `aws` | **`aws_read`** — generic read-only call to *any* AWS API (see below) |
 - **Core tools** — `list_accounts`, `list_modules`, `health_check`,
-  `run_across_accounts` (one read tool → many accounts in parallel, partial
-  results), `list_assumable_roles`, and `assume_role` (MFA-aware, see below).
+  `switch_account`, `run_across_accounts` (one read tool → many accounts in
+  parallel, partial results), `list_assumable_roles`, and `assume_role`
+  (ad-hoc role by ARN). See *Credentials & login* for roles + MFA.
 - **Prompts** — ready-made workflows in the client's prompt menu:
   `daily_health_report`, `incident_triage`, `security_review`, `cost_review`.
 - **Hardening** — every tool call is time-limited and writes one JSON audit
@@ -80,82 +81,61 @@ Restart Claude Desktop and ask: *"List my S3 buckets and check whether any are p
 
 ## Credentials & login
 
-The server never handles passwords itself — it discovers and uses whatever is
-in `~/.aws`. Three supported flows:
+The server never handles passwords — it uses whatever is in `~/.aws`, and
+reloads it automatically when it changes. Run `npm link` once to get the
+short **`awscm`** command (until then, `node dist/core/server.js` works in its
+place); `awscm help` lists everything.
 
-**Plain access keys** — `aws configure --profile <name>` once; nothing else needed.
+| You have | Do this |
+| --- | --- |
+| Access keys | `aws configure --profile <name>` — done |
+| SSO | `aws sso login --profile <name>` |
+| Keys + MFA policy | `awscm login` |
+| Roles to assume | `awscm role add` once, then `role use` to switch |
 
-**SSO (browser + MFA)** — `aws configure sso` once, then per session:
-
-```bash
-aws sso login --profile <name>
-```
-
-**MFA-gated IAM keys (terminal + TOTP)** — for profiles whose IAM policy
-denies everything until an MFA session exists. The built-in `login`
-subcommand mints temporary session credentials into a `[copilot-session]`
-profile the server auto-discovers:
+### Roles (with or without MFA)
 
 ```bash
-# 1. one-time: point the profile at your MFA device
-#    (device ARN: AWS console → IAM → your user → Security credentials;
-#     looks like arn:aws:iam::<account-id>:mfa/<device-name>)
-aws configure set mfa_serial arn:aws:iam::<account-id>:mfa/<device-name> --profile <name>
+# once per role — finds your MFA device and saves a normal AWS CLI profile
+awscm role add prod-ro arn:aws:iam::123456789012:role/ReadOnly --profile <your-profile>
 
-# 2. each session: prompts for your 6-digit TOTP code
-node dist/core/server.js login --profile <name> --duration-hours 8
-
-# 3. verify — these succeed because the session was minted WITH MFA,
-#    so the policy's explicit deny lifts
-aws sts get-caller-identity --profile copilot-session
-aws s3api list-buckets --profile copilot-session --query 'Buckets[0].Name'
+# switch any time
+awscm role use prod-ro      # asks for the 6-digit code only if needed
+awscm role use staging-ro   # same day: no code — the MFA session is reused for 12h
+awscm role list             # roles, which one is active (*), session status
 ```
 
-Then point the server at the session profile
-(`DEVOPS_COPILOT_PROFILES=copilot-session` in the client `env` block).
-When credentials expire, tool errors tell you exactly which command to rerun.
-If `mfa_serial` isn't configured, `login` looks up your registered MFA device
-itself (IAM `ListMFADevices` on your own user) and offers the command to save it.
+The copilot always sees the active role (profile `copilot-active`), so
+`role use` in a terminal switches it on the next request — no restart. In
+chat you can also say *"switch to prod-ro"* (`switch_account`); if a code is
+needed, the client shows a prompt, and the code goes to the server only,
+never into the AI conversation. Saved roles work with the plain AWS CLI too:
+`aws s3 ls --profile prod-ro`.
 
-### Assuming roles with MFA (no passwords — just the 6-digit code)
+Don't know the role ARN? Ask *"which roles can I assume?"*
+(`list_assumable_roles`): it lists roles in `~/.aws/config` and roles in your
+account that trust you, flagging MFA / ExternalId requirements.
 
-You give the **role ARN**; the server works out the rest:
+### MFA session without roles
 
-1. **Who am I?** — STS `GetCallerIdentity` → your IAM user ARN.
-2. **Which MFA device?** — profile `mfa_serial`, else IAM `ListMFADevices` on
-   your own user, else the conventional `mfa/<username>` name.
-3. **Is MFA needed?** — it first tries without; only if AWS denies it (or the
-   profile/trust policy says MFA is required) are you asked for a code.
-4. **MFA session → role** — STS `GetSessionToken(serial, code)`, then
-   `AssumeRole` *from that MFA session*. This works even under "deny
-   everything without MFA" policies, and lets the role refresh silently
-   for up to 12h without another code.
-
-Three ways to use it:
+For IAM users whose policy denies everything until MFA is used:
 
 ```bash
-# A) In chat — find roles, then assume one. The code is asked in the
-#    client's own prompt (MCP elicitation): it goes to the server only,
-#    never into the AI conversation.
-#    "list the roles I can assume"   -> list_assumable_roles
-#    "assume arn:aws:iam::123456789012:role/ReadOnly as prod-ro" -> assume_role
-#    then: "list buckets in prod-ro"
-
-# B) Terminal — writes [copilot-ReadOnly] to ~/.aws/credentials
-node dist/core/server.js login --profile <your-profile> \
-  --role-arn arn:aws:iam::123456789012:role/ReadOnly [--duration-hours 1]
-
-# C) Zero-touch — a normal AWS role profile; the server asks for the code
-#    in the client the first time the profile is used
-[profile prod-ro]                        # ~/.aws/config
-role_arn       = arn:aws:iam::123456789012:role/ReadOnly
-source_profile = <your-profile>
-mfa_serial     = arn:aws:iam::<your-account>:mfa/<device>
+awscm login --profile <your-profile>   # 6-digit code -> 12h session (profile copilot-session)
 ```
 
-`list_assumable_roles` shows roles configured in `~/.aws/config` and roles in
-the current account whose trust policy allows you (flagging MFA / ExternalId
-requirements). Roles in other accounts can't be listed — assume them by ARN.
+The MFA device is detected automatically (set `mfa_serial` on the profile
+to pin it). `role use` reuses this session, so after `login` switching
+roles needs no code at all.
+
+<details><summary>How it works</summary>
+
+1. `GetCallerIdentity` → your IAM user; IAM `ListMFADevices` on yourself → MFA device.
+2. Try the role without MFA; only if AWS says no, ask for the code.
+3. `GetSessionToken(device, code)` → a 12h MFA session (cached in `copilot-session`),
+   then `AssumeRole` from that session. This also works under "deny everything
+   without MFA" policies, and lets roles refresh without new codes.
+</details>
 
 ## Testing with MCP Inspector
 
@@ -225,7 +205,7 @@ least the `Describe*/List*/Get*` actions for the services you use:
 | domain trace / certs | `route53:ListHostedZones`, `route53:ListResourceRecordSets`, `acm:ListCertificates` |
 | waste finder | `ec2:DescribeVolumes/Addresses/Snapshots`, `cloudwatch:GetMetricStatistics`, `rds:Describe*`, `lambda:ListFunctions` |
 | tags, containers | `tag:GetResources`, `ecs:List*/Describe*`, `eks:List*/Describe*` |
-| roles | `sts:AssumeRole` on the role, `iam:ListRoles` (discovery), `iam:ListMFADevices` on yourself |
+| roles | `sts:AssumeRole` on the role, `sts:GetSessionToken`, `iam:ListMFADevices` on yourself, `iam:ListRoles` (discovery only) |
 
 A denied call returns the AWS error to the LLM; composite tools (scorecard,
 waste finder, traces) return partial results and mark the denied sections as

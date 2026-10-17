@@ -8,7 +8,7 @@ import {
   validateMfaCode,
   type MfaDeps,
 } from "../src/core/mfa.js";
-import { parseLoginArgs, roleProfileName } from "../src/core/login.js";
+import { parseLoginArgs } from "../src/core/login.js";
 import { memoizeCredentials, AwsClientFactory } from "../src/core/aws-client.js";
 
 const USER_ARN = "arn:aws:iam::111122223333:user/alice";
@@ -230,23 +230,19 @@ describe("trust policy analysis", () => {
 });
 
 describe("login argument parsing", () => {
-  it("session mode defaults to 8h; role mode to 1h", () => {
-    expect(parseLoginArgs(["--profile", "work"])).toMatchObject({ profile: "work", durationSeconds: 8 * 3600 });
-    expect(parseLoginArgs(["--profile", "work", "--role-arn", ROLE_ARN])).toMatchObject({ roleArn: ROLE_ARN, durationSeconds: 3600 });
-    expect(parseLoginArgs(["--role-arn", ROLE_ARN, "--duration-hours", "2", "--mfa-serial", SERIAL, "--name", "prod-ro"])).toMatchObject({
+  it("defaults to AWS_PROFILE / default and a 12h session", () => {
+    expect(parseLoginArgs([], {})).toMatchObject({ profile: "default", durationSeconds: 12 * 3600 });
+    expect(parseLoginArgs([], { AWS_PROFILE: "work" }).profile).toBe("work");
+    expect(parseLoginArgs(["--profile", "x", "--duration-hours", "2", "--mfa-serial", SERIAL], {})).toMatchObject({
+      profile: "x",
       durationSeconds: 7200,
       mfaSerial: SERIAL,
-      name: "prod-ro",
     });
   });
 
   it("rejects unknown flags and bad durations", () => {
-    expect(() => parseLoginArgs(["--password", "x"])).toThrow(/Unknown option/);
-    expect(() => parseLoginArgs(["--duration-hours", "abc"])).toThrow(/positive/);
-  });
-
-  it("derives a profile name from the role ARN", () => {
-    expect(roleProfileName("arn:aws:iam::1:role/path/ReadOnly")).toBe("copilot-ReadOnly");
+    expect(() => parseLoginArgs(["--password", "x"], {})).toThrow(/Unknown option/);
+    expect(() => parseLoginArgs(["--duration-hours", "abc"], {})).toThrow(/positive/);
   });
 });
 

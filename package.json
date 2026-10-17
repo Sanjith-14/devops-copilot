@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist/core/server.js",
   "bin": {
-    "devops-copilot": "dist/core/server.js"
+    "devops-copilot": "dist/core/server.js",
+    "awscm": "dist/core/server.js"
   },
   "scripts": {
     "build": "tsc && node scripts/copy-md.mjs",

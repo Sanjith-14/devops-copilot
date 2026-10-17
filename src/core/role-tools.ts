@@ -55,7 +55,7 @@ export function registerRoleTools(server: McpServer, factory: AwsClientFactory):
             roleArn: cfg.role_arn,
             sourceProfile: cfg.source_profile,
             mfaSerial: cfg.mfa_serial,
-            howToUse: `already available — pass account: "${a.id}" to any tool${cfg.mfa_serial ? " (you'll be prompted for an MFA code)" : ""}`,
+            howToUse: `switch_account "${a.id}" (or pass account: "${a.id}" to any tool)${cfg.mfa_serial ? " — MFA code asked only if needed" : ""}`,
           }));
 
         const mfa = await bestEffort(() =>
@@ -118,7 +118,8 @@ export function registerRoleTools(server: McpServer, factory: AwsClientFactory):
     "assume_role",
     {
       description:
-        "[READ] Assume an IAM role via STS and register it as a temporary account for this session (usable via the " +
+        "[READ] Ad-hoc: assume a role by ARN for this session only (for roles saved with `awscm role add`, " +
+        "use switch_account instead). Registers it as a temporary account (usable via the " +
         "`account` parameter of every tool). Requires interactive user approval. MFA is handled automatically: the " +
         "server finds your MFA device and, only if the role needs it, asks YOU (not the model) for the 6-digit code " +
         "in a client prompt — no passwords. Credentials refresh silently for up to 12h. Access is bounded by the " +
@@ -162,8 +163,7 @@ export function registerRoleTools(server: McpServer, factory: AwsClientFactory):
         if (!canElicit(server)) {
           throw new GuardrailViolation(
             "assume_role requires interactive user approval, but this MCP client does not support elicitation. " +
-              "Use `devops-copilot login --profile <name> --role-arn <arn>` in a terminal, or add a profile with " +
-              "role_arn/source_profile/mfa_serial to ~/.aws/config.",
+              "In a terminal: `awscm role add <name> <role-arn>` then `awscm role use <name>`.",
           );
         }
         const source = factory.resolveAccount(args.sourceAccount);

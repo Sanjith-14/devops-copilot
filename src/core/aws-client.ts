@@ -1,7 +1,27 @@
 import { fromIni } from "@aws-sdk/credential-providers";
-import { loadSharedConfigFiles } from "@smithy/shared-ini-file-loader";
 import type { AwsCredentialIdentity, AwsCredentialIdentityProvider } from "@aws-sdk/types";
 import type { AccountConfig, CopilotConfig } from "./types.js";
+import { awsFilesStamp, loadAwsFiles, profileSection } from "./aws-files.js";
+import { ACTIVE_PROFILE, getRoleCredentials, isRoleProfile } from "./roles.js";
+import { SESSION_PROFILE } from "./login.js";
+
+/** Human description of a profile for list_accounts. Pure. */
+export function describeProfile(name: string, s: Record<string, string | undefined>, now = Date.now()): string {
+  const until = (iso?: string) => {
+    if (!iso) return "";
+    const t = new Date(iso);
+    return t.getTime() > now ? ` until ${t.toISOString()}` : " (EXPIRED)";
+  };
+  if (name === ACTIVE_PROFILE) {
+    return `Active role "${s.copilot_role ?? "?"}" (${s.copilot_role_arn ?? "?"})${until(s.copilot_expiration)} — switch with \`awscm role use <name>\``;
+  }
+  if (name === SESSION_PROFILE) return `MFA session for "${s.copilot_source_profile ?? "?"}"${until(s.copilot_expiration)}`;
+  if (isRoleProfile(s)) return `Role ${s.role_arn} via "${s.source_profile}"${s.mfa_serial ? " (MFA if needed)" : ""}`;
+  if (s.sso_account_id || s.sso_session) {
+    return `SSO${s.sso_account_id ? ` account ${s.sso_account_id}` : ""}${s.sso_role_name ? ` / ${s.sso_role_name}` : ""}`;
+  }
+  return "local credentials";
+}
 
 /** Asks the human for an MFA code (wired to MCP elicitation by the server). */
 export type MfaCodeProvider = (serial: string, purpose: string) => Promise<string>;
@@ -50,10 +70,14 @@ export class AwsClientFactory {
   private defaultAccountId = "default";
   /** Raw ~/.aws config sections per profile (role_arn, mfa_serial, source_profile, ...). */
   private sections = new Map<string, Record<string, string | undefined>>();
+  /** mtime stamp of the ~/.aws files at last discovery ("" = never discovered). */
+  private stamp = "";
+  /** Default picked via switch_account; survives reloads. */
+  private chosenDefault?: string;
   private mfaCodeProvider: MfaCodeProvider = async (serial) => {
     throw new Error(
       `MFA code required for ${serial}, but this client cannot prompt. ` +
-        "Run `devops-copilot login --profile <name>` in a terminal first.",
+        "Run `awscm role use <name>` (or `awscm login`) in a terminal first.",
     );
   };
 
@@ -75,26 +99,22 @@ export class AwsClientFactory {
 
   /**
    * Scan ~/.aws/config + ~/.aws/credentials and register every profile as an
-   * account (honoring the allowlist). Must be called once before serving.
+   * account (honoring the allowlist). Called at startup and again by
+   * refreshIfChanged() whenever the files change; assumed-role (ephemeral)
+   * accounts survive reloads.
    */
   async discoverAccounts(): Promise<void> {
-    const { configFile, credentialsFile } = await loadSharedConfigFiles();
-    const names = new Set([...Object.keys(configFile ?? {}), ...Object.keys(credentialsFile ?? {})]);
+    const files = await loadAwsFiles();
+    this.stamp = awsFilesStamp();
+    for (const id of [...this.accounts.keys()]) if (!this.ephemeralCreds.has(id)) this.accounts.delete(id);
+    this.sections.clear();
 
+    const names = new Set([...Object.keys(files.config), ...Object.keys(files.credentials)]);
     for (const name of names) {
       if (this.cfg.profileAllowlist && !this.cfg.profileAllowlist.includes(name)) continue;
-      const section = { ...(credentialsFile?.[name] ?? {}), ...(configFile?.[name] ?? {}) };
+      const section = profileSection(files, name);
       this.sections.set(name, section);
-      this.accounts.set(name, {
-        id: name,
-        profile: name,
-        defaultRegion: section.region,
-        description: section.role_arn
-          ? `AssumeRole via profile (${section.role_arn})${section.mfa_serial ? " + MFA" : ""}`
-          : section.sso_account_id || section.sso_session
-            ? `SSO${section.sso_account_id ? ` account ${section.sso_account_id}` : ""}${section.sso_role_name ? ` / ${section.sso_role_name}` : ""}`
-            : "local credentials",
-      });
+      this.accounts.set(name, { id: name, profile: name, defaultRegion: section.region, description: describeProfile(name, section) });
     }
 
     if (this.accounts.size === 0) {
@@ -104,9 +124,10 @@ export class AwsClientFactory {
       );
     }
 
-    // Default account: env preference -> "default" profile -> first discovered.
+    // Default account: chosen in-session -> env preference -> "default" -> first discovered.
     const preferred = this.cfg.defaultAccount;
-    if (preferred && this.accounts.has(preferred)) this.defaultAccountId = preferred;
+    if (this.chosenDefault && this.accounts.has(this.chosenDefault)) this.defaultAccountId = this.chosenDefault;
+    else if (preferred && this.accounts.has(preferred)) this.defaultAccountId = preferred;
     else if (this.accounts.has("default")) this.defaultAccountId = "default";
     else this.defaultAccountId = [...this.accounts.keys()][0];
 
@@ -116,6 +137,35 @@ export class AwsClientFactory {
           `Known: ${[...this.accounts.keys()].join(", ")}`,
       );
     }
+  }
+
+  /**
+   * Hot-reload: if ~/.aws changed (e.g. `awscm role use x` in a
+   * terminal), re-discover profiles and drop cached credentials/clients so
+   * the next call uses the new role — no MCP client restart needed.
+   */
+  async refreshIfChanged(): Promise<boolean> {
+    if (!this.stamp || awsFilesStamp() === this.stamp) return false;
+    try {
+      await this.discoverAccounts();
+    } catch (err) {
+      this.stamp = awsFilesStamp();
+      console.error(`[aws] reload of ~/.aws failed, keeping previous accounts: ${String(err)}`);
+      return false;
+    }
+    this.credCache.clear();
+    for (const key of [...this.clientCache.keys()]) {
+      if (!this.ephemeralCreds.has(key.split(":")[1])) this.clientCache.delete(key);
+    }
+    console.error("[aws] ~/.aws changed — profiles reloaded");
+    return true;
+  }
+
+  /** Switch the default account for the rest of this session (switch_account tool). */
+  setDefaultAccount(accountId: string): void {
+    this.resolveAccount(accountId);
+    this.chosenDefault = accountId;
+    this.defaultAccountId = accountId;
   }
 
   /**
@@ -167,14 +217,23 @@ export class AwsClientFactory {
 
     let creds = this.credCache.get(account.id);
     if (!creds) {
-      // Profiles with role_arn + mfa_serial ask the user for a code via the
-      // server's MFA prompt (MCP elicitation) instead of failing.
-      creds = memoizeCredentials(
-        fromIni({
-          profile: account.profile,
-          mfaCodeProvider: (serial: string) => this.mfaCodeProvider(serial, `profile "${account.profile}"`),
-        }),
-      );
+      const section = this.profileConfig(account.id);
+      creds = isRoleProfile(section) && !section.credential_source
+        ? // Role profiles use the same flow as `awscm role use`: reuse
+          // today's MFA session if cached, else ask for a code (MCP elicitation)
+          // only if the role needs it.
+          memoizeCredentials(async () =>
+            (await getRoleCredentials(account.profile, {
+              getCode: (serial) => this.mfaCodeProvider(serial, `assume role "${account.profile}"`),
+            })).credentials,
+          )
+        : memoizeCredentials(
+            fromIni({
+              profile: account.profile,
+              ignoreCache: true,
+              mfaCodeProvider: (serial: string) => this.mfaCodeProvider(serial, `profile "${account.profile}"`),
+            }),
+          );
       this.credCache.set(account.id, creds);
     }
     return creds;

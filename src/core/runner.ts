@@ -64,7 +64,7 @@ export function withLoginHint(message: string): string {
     return `${message}\nHint: the SSO session has expired — ask the user to run \`aws sso login --profile <profile>\` in a terminal, then retry.`;
   }
   if (/ExpiredToken|token.*expired|credentials.*expired/i.test(message)) {
-    return `${message}\nHint: temporary credentials have expired — ask the user to re-run \`devops-copilot login --profile <profile>\` (or assume_role again), then retry.`;
+    return `${message}\nHint: temporary credentials have expired — ask the user to run \`awscm role use <name>\` (or \`awscm login\`) in a terminal, or switch_account again, then retry.`;
   }
   return message;
 }
@@ -98,7 +98,7 @@ export async function askMfaCode(server: McpServer, serial: string, purpose: str
   if (!canElicit(server)) {
     throw new GuardrailViolation(
       `An MFA code for ${serial} is needed to ${purpose}, but this MCP client cannot show prompts. ` +
-        "Run `devops-copilot login --profile <name> [--role-arn <arn>]` in a terminal instead, then retry.",
+        "Run `awscm role use <name>` (or `awscm login`) in a terminal instead, then retry.",
     );
   }
   const res = await server.server.elicitInput({

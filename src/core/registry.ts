@@ -125,6 +125,7 @@ export function registerModules(
           const started = Date.now();
           let ctx: ToolContext | undefined;
           try {
+            await factory.refreshIfChanged(); // picks up `awscm role use` from a terminal
             const account = factory.resolveAccount(args.account as string | undefined);
             const region = factory.resolveRegion(account, args.region as string | undefined);
             ctx = { accountId: account.id, region };
@@ -187,15 +188,48 @@ export function registerCoreTools(
         "[READ] List usable AWS accounts: profiles auto-discovered from ~/.aws plus any roles assumed this session. Marks the default.",
       inputSchema: {},
     },
-    async () =>
-      asText(
+    async () => {
+      await factory.refreshIfChanged();
+      return asText(
         factory.listAccounts().map((a) => ({
           id: a.id,
           description: a.description ?? "",
           region: a.defaultRegion,
           default: a.id === factory.defaultAccount() || undefined,
         })),
-      ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "switch_account",
+    {
+      description:
+        "[READ] Switch which account/role every tool uses by default for the rest of this session, e.g. " +
+        "'switch to prod-ro'. Works for any id from list_accounts, including role profiles added with " +
+        "`awscm role add` — if the role needs MFA, the user is asked for the 6-digit code in a prompt " +
+        "(only if needed; today's MFA session is reused). Returns the identity now in use.",
+      inputSchema: { account: z.string().max(128).describe("Account id from list_accounts, e.g. 'prod-ro'") },
+    },
+    async (args: { account: string }) => {
+      const started = Date.now();
+      try {
+        await factory.refreshIfChanged();
+        const account = factory.resolveAccount(args.account);
+        const region = factory.resolveRegion(account);
+        await factory.ensureCredentials(account); // MFA prompt happens here, if needed
+        const { STSClient, GetCallerIdentityCommand } = await import("@aws-sdk/client-sts");
+        const id = await new STSClient({ region, credentials: factory.credentialsFor(account) }).send(new GetCallerIdentityCommand({}));
+        const previous = factory.defaultAccount();
+        factory.setDefaultAccount(account.id);
+        audit({ tool: "switch_account", account: account.id, region, risk: "read", ms: Date.now() - started, outcome: "ok" });
+        return asText({ switchedFrom: previous, nowUsing: account.id, identity: id.Arn, region, description: account.description });
+      } catch (err) {
+        audit({ tool: "switch_account", account: args.account, risk: "read", ms: Date.now() - started, outcome: outcomeOf(err), error: err });
+        const message = err instanceof GuardrailViolation ? err.message : `Error in switch_account: ${String(err)}`;
+        return asText(withLoginHint(message), true);
+      }
+    },
   );
 
   registerRoleTools(server, factory);
@@ -226,6 +260,7 @@ export function registerCoreTools(
       },
     },
     async (args: { account?: string; region?: string }) => {
+      await factory.refreshIfChanged();
       const account = factory.resolveAccount(args.account);
       const region = factory.resolveRegion(account, args.region);
       const ctx: ToolContext = { accountId: account.id, region };
@@ -264,6 +299,7 @@ export function registerCoreTools(
     async (input: { tool: string; args?: Record<string, unknown>; accounts?: string[]; region?: string }) => {
       const started = Date.now();
       try {
+        await factory.refreshIfChanged();
         const tool = toolIndex.get(input.tool);
         if (!tool) {
           const near = [...toolIndex.keys()].filter((n) => n.includes(input.tool.split("_").pop() ?? "")).slice(0, 8);
